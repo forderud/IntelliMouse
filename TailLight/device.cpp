@@ -1,46 +1,86 @@
 #include "driver.h"
 #include <Hidport.h>
+#include "SetBlack.h"
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControlFilter;
 
 
-VOID EvtSetBlackTimer(_In_ WDFTIMER  Timer) {
-    KdPrint(("TailLight: EvtSetBlackTimer begin\n"));
+NTSTATUS PnpNotifyDeviceInterfaceChange(
+    _In_ PVOID pvNotificationStructure,
+    _Inout_opt_ PVOID pvContext)
+/*++
+Routine Description:
+    Filters out HID class device interface arrivals.
 
-    WDFDEVICE device = (WDFDEVICE)WdfTimerGetParentObject(Timer);
-    NT_ASSERTMSG("EvtSetBlackTimer device NULL\n", device);
+Arguments:
+    PVOID - One of several possible notification structures. All we care about
+            for this implementation is DEVICE_INTERFACE_CHANGE_NOTIFICATION.
 
-    NTSTATUS status = SetFeatureColor(device, 0);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("TailLight: EvtSetBlackTimer failure NTSTATUS=0x%x\n", status));
-        return;
+    PVOID - The WDFDEVICE that we received from EvtDriverDeviceAdd.
+
+--*/
+
+{
+
+    //KdPrint(("TailLight: PnpNotifyDeviceInterfaceChange enter\n"));
+    NT_ASSERTMSG("WDFDEVICE not passed in!", pvContext);
+
+    if (pvNotificationStructure == NULL) {
+        return STATUS_SUCCESS;
     }
 
-    KdPrint(("TailLight: EvtSetBlackTimer end\n"));
+    PDEVICE_INTERFACE_CHANGE_NOTIFICATION pDevInterface =
+        (PDEVICE_INTERFACE_CHANGE_NOTIFICATION)pvNotificationStructure;
+
+    ASSERT(IsEqualGUID(pDevInterface->InterfaceClassGuid,
+        GUID_DEVINTERFACE_HID));
+
+    {     
+        // Assumption: Device will arrive before removal.
+        if (IsEqualGUID(pDevInterface->Event,
+            GUID_DEVICE_INTERFACE_ARRIVAL)) {
+
+            // Opening a device may trigger PnP operations. Ensure that either a
+            // timer or a work item is used when opening up a device.
+            // Refer to page 356 of "Programming The Microsoft Windows Driver
+            // Model", 2nd edition by Walter Oney and IoGetDeviceObjectPointer.
+            // 
+            // Also note that eventually several system threads will be running
+            // in parallel. As a PnP system thread must not block, serializing
+            // would require a queue.
+            //
+            // NOTE: It is possible for us to get blocked waiting for a system
+            // thread. One solution would be to use a timer that spawns a
+            // system thread on timeout vs. a wait loop.
+            //
+            // What the operating system does with the return value is
+            // undocumented. Since the docs say to return success or an error
+            // value, follow the spec.
+            return CreateWorkItemForIoTargetOpenDevice((WDFDEVICE)pvContext,
+                *pDevInterface->SymbolicLinkName);
+        }
+    }
+
+    return STATUS_SUCCESS;
 }
 
+
 NTSTATUS EvtSelfManagedIoInit(WDFDEVICE device) {
-    // Initialize tail-light to black to have control over HW state
-    WDF_TIMER_CONFIG timerCfg = {};
-    WDF_TIMER_CONFIG_INIT(&timerCfg, EvtSetBlackTimer);
 
-    WDF_OBJECT_ATTRIBUTES attribs = {};
-    WDF_OBJECT_ATTRIBUTES_INIT(&attribs);
-    attribs.ParentObject = device;
-    attribs.ExecutionLevel = WdfExecutionLevelPassive; // required to access HID functions
+    WDFDRIVER driver = WdfDeviceGetDriver(device);
+    DEVICE_CONTEXT* pDeviceContext = WdfObjectGet_DEVICE_CONTEXT(device);
 
-    WDFTIMER timer = nullptr;
-    NTSTATUS status = WdfTimerCreate(&timerCfg, &attribs, &timer);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("WdfTimerCreate failed 0x%x\n", status));
-        return status;
-    }
+    NTSTATUS status = STATUS_SUCCESS;
 
-    status = WdfTimerStart(timer, 0); // no wait
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("WdfTimerStart failed 0x%x\n", status));
-        return status;
-    }
+    status = IoRegisterPlugPlayNotification(
+        EventCategoryDeviceInterfaceChange,
+        PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+        (PVOID)&GUID_DEVINTERFACE_HID,
+        WdfDriverWdmGetDriverObject(driver),
+        PnpNotifyDeviceInterfaceChange,
+        (PVOID)device,
+        &pDeviceContext->pnpDevInterfaceChangedHandle
+    );
 
     return status;
 }
@@ -68,6 +108,40 @@ UNICODE_STRING GetTargetPropertyString(WDFIOTARGET target, DEVICE_REGISTRY_PROPE
     result.MaximumLength = (USHORT)bufferLength;
     result.Length = (USHORT)bufferLength - sizeof(UNICODE_NULL);
     return result;
+}
+
+
+VOID EvtCleanupCallback(
+    _In_ WDFOBJECT object
+)
+/*++
+Routine Description:
+    Removes the plug and play notification callback if registered.
+    Called near the end of processing an IRP_MN_REMOVE_DEVICE.
+    This work could also be done at EvtDeviceSelfManagedIoCleanup, which
+    comes before this callback. However using the lifetime of the device
+    context means that the PnP notification handle will be around for all users
+    of the device context, while the EvtDeviceSelfManagedIoCleanup would
+    present a small time where the handle is "dangling." In addition, 
+    IoRegisterPlugPlayNotification adds a reference to our device object. Thus,
+    if the PnP notification handle is not removed, our driver will not unload
+    and DriverUnload will not be called. Please see page 355 of "Programming
+    The Microsoft Windows Driver Model", 2nd edition, by Walter Oney.
+
+Arguments:
+    WDFOBJECT - Handle to a framework device object from AddDevice
+--*/
+{
+    DEVICE_CONTEXT* pDeviceContext = WdfObjectGet_DEVICE_CONTEXT(object);
+
+    if (pDeviceContext->pnpDevInterfaceChangedHandle) {
+        NTSTATUS status = STATUS_SUCCESS;
+        status = IoUnregisterPlugPlayNotificationEx(pDeviceContext->pnpDevInterfaceChangedHandle);
+        if (!NT_SUCCESS(status)) {
+            KdPrint(("IoUnregisterPlugPlayNotification failed with 0x%x\n", status));
+        }
+    }
+    pDeviceContext->pnpDevInterfaceChangedHandle = NULL;
 }
 
 
@@ -102,6 +176,7 @@ Arguments:
         // create device
         WDF_OBJECT_ATTRIBUTES attributes = {};
         WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
+        attributes.EvtCleanupCallback = EvtCleanupCallback;
 
         NTSTATUS status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
         if (!NT_SUCCESS(status)) {

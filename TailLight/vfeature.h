@@ -26,10 +26,10 @@ private:
 };
 
 
-NTSTATUS SetFeatureColor (
+NTSTATUS SetFeatureColor(
     _In_  WDFDEVICE Device,
     _In_  ULONG     Color
-    );
+);
 
 NTSTATUS SetFeatureFilter(
     _In_ WDFDEVICE  Device,
