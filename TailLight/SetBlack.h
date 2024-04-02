@@ -1,0 +1,11 @@
+#pragma once
+
+struct SET_BLACK_WORKITEM_CONTEXT {
+    UNICODE_STRING symLink;
+};
+
+WDF_DECLARE_CONTEXT_TYPE(SET_BLACK_WORKITEM_CONTEXT);
+
+NTSTATUS CreateWorkItemForIoTargetOpenDevice(WDFDEVICE device, CONST UNICODE_STRING& symLink);
+NTSTATUS SetBlackAsync(WDFDEVICE device, 
+    CONST UNICODE_STRING& symLink);
